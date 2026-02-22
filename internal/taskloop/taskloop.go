@@ -8,6 +8,8 @@ package taskloop
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	atomicx "github.com/pion/ice/v4/internal/atomic"
@@ -29,6 +31,8 @@ type Loop struct {
 	done         chan struct{}
 	taskLoopDone chan struct{}
 	err          atomicx.Error
+	id           string // identifier for logging
+	taskCount    atomic.Int64
 }
 
 // New creates and starts a new task loop.
@@ -39,6 +43,7 @@ func New(onClose func()) *Loop {
 		taskLoopDone: make(chan struct{}),
 	}
 
+	l.id = fmt.Sprintf("%p", l)
 	go l.runLoop(onClose)
 
 	return l
@@ -56,6 +61,7 @@ func (l *Loop) runLoop(onClose func()) {
 		case <-l.done:
 			return
 		case t := <-l.tasks:
+			l.taskCount.Add(1)
 			t.fn(l)
 			close(t.done)
 		}

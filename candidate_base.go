@@ -270,17 +270,24 @@ func (c *candidateBase) recvLoop(initializedCh <-chan struct{}) {
 		return
 	}
 
+	pktCount := 0
 	for {
+		agent.log.Tracef("recvLoop waiting for ReadFrom on %s", c)
 		n, srcAddr, err := c.conn.ReadFrom(buf)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				agent.log.Warnf("Failed to read from candidate %s: %v", c, err)
 			}
+			agent.log.Tracef("recvLoop exiting for %s after %d packets, err=%v", c, pktCount, err)
 
 			return
 		}
+		pktCount++
+		agent.log.Tracef("recvLoop read pkt #%d from %s on %s (%d bytes), submitting to loop", pktCount, srcAddr, c, n)
 
 		c.handleInboundPacket(buf[:n], srcAddr)
+
+		agent.log.Tracef("recvLoop pkt #%d on %s: handleInboundPacket returned", pktCount, c)
 	}
 }
 
@@ -318,12 +325,16 @@ func (c *candidateBase) handleInboundPacket(buf []byte, srcAddr net.Addr) {
 			return
 		}
 
+		agent.log.Tracef("handleInboundPacket: submitting STUN from %s to loop for %s", srcAddr, c)
 		if err := agent.loop.Run(c, func(_ context.Context) {
 			// nolint: contextcheck
+			agent.log.Tracef("TASK_START handleInbound from %s on %s (agent=%p)", srcAddr, c, agent)
 			agent.handleInbound(msg, c, srcAddr)
+			agent.log.Tracef("TASK_END handleInbound from %s on %s", srcAddr, c)
 		}); err != nil {
-			agent.log.Warnf("Failed to handle message: %v", err)
+			agent.log.Warnf("Failed to handle message from %s: %v (candidate closed: %v)", srcAddr, err, c.Err())
 		}
+		agent.log.Tracef("handleInboundPacket: loop.Run returned for STUN from %s on %s", srcAddr, c)
 
 		return
 	}
@@ -392,7 +403,14 @@ func (c *candidateBase) close() error {
 }
 
 func (c *candidateBase) writeTo(raw []byte, dst Candidate) (int, error) {
+	// Set a write deadline to prevent blocking forever on macOS when the
+	// remote address is unreachable and the kernel send buffer fills up.
+	if err := c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		c.agent().log.Warnf("Failed to set write deadline: %v", err)
+	}
 	n, err := c.conn.WriteTo(raw, dst.addr())
+	// Clear the deadline so future writes aren't affected.
+	_ = c.conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		// If the connection is closed, we should return the error
 		if errors.Is(err, io.ErrClosedPipe) {

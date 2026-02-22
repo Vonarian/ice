@@ -661,10 +661,13 @@ func (a *Agent) connectivityChecks() { //nolint:cyclop
 				lastConnectionState = a.connectionState
 			}()
 
+			a.log.Tracef("contact() task START (agent=%p, state=%s)", a, a.connectionState)
+
 			switch a.connectionState {
 			case ConnectionStateFailed:
 				// The connection is currently failed so don't send any checks
 				// In the future it may be restarted though
+				a.log.Tracef("contact() task END (state=Failed, skipping)")
 				return
 			case ConnectionStateChecking:
 				// We have just entered checking for the first time so update our checking timer
@@ -676,12 +679,14 @@ func (a *Agent) connectivityChecks() { //nolint:cyclop
 				if time.Since(checkingDuration) > a.disconnectedTimeout+a.failedTimeout {
 					a.updateConnectionState(ConnectionStateFailed)
 
+					a.log.Tracef("contact() task END (timed out, now Failed)")
 					return
 				}
 			default:
 			}
 
 			a.getSelector().ContactCandidates()
+			a.log.Tracef("contact() task END (agent=%p)", a)
 		}); err != nil {
 			a.log.Warnf("Failed to start connectivity checks: %v", err)
 		}
@@ -717,7 +722,12 @@ func (a *Agent) connectivityChecks() { //nolint:cyclop
 			if !timer.Stop() {
 				<-timer.C
 			}
-			contact()
+			// Instead of calling contact() immediately, reset the timer to
+			// a short interval. This coalesces rapid force checks (e.g., from
+			// multiple AddRemoteCandidate calls) and gives inbound STUN
+			// responses time to be processed by the task loop, preventing
+			// binding request starvation.
+			timer.Reset(a.checkInterval)
 		case <-timer.C:
 			contact()
 		case <-a.loop.Done():
@@ -770,16 +780,19 @@ func (a *Agent) setSelectedPair(pair *CandidatePair) {
 }
 
 func (a *Agent) pingAllCandidates() {
-	a.log.Trace("Pinging all candidates")
+	a.log.Tracef("Pinging all candidates (agent=%p, pairs=%d)", a, len(a.checklist))
 
 	if len(a.checklist) == 0 {
 		a.log.Warn("Failed to ping without candidate pairs. Connection is not possible yet.")
 	}
 
-	for _, p := range a.checklist {
+	pinged := 0
+	skipped := 0
+	for i, p := range a.checklist {
 		if p.state == CandidatePairStateWaiting {
 			p.state = CandidatePairStateInProgress
 		} else if p.state != CandidatePairStateInProgress {
+			skipped++
 			continue
 		}
 
@@ -787,10 +800,14 @@ func (a *Agent) pingAllCandidates() {
 			a.log.Tracef("Maximum requests reached for pair %s, marking it as failed", p)
 			p.state = CandidatePairStateFailed
 		} else {
+			a.log.Tracef("pingAllCandidates: BEFORE ping pair #%d/%d: %s -> %s (bindReq=%d)", i, len(a.checklist), p.Local, p.Remote, p.bindingRequestCount)
 			a.getSelector().PingCandidate(p.Local, p.Remote)
+			a.log.Tracef("pingAllCandidates: AFTER ping pair #%d/%d", i, len(a.checklist))
 			p.bindingRequestCount++
+			pinged++
 		}
 	}
+	a.log.Tracef("pingAllCandidates DONE (agent=%p, pinged=%d, skipped=%d)", a, pinged, skipped)
 }
 
 // keepAliveCandidatesForRenomination pings all candidate pairs to keep them tested
@@ -855,6 +872,42 @@ func (a *Agent) getBestValidCandidatePair() *CandidatePair {
 	}
 
 	return best
+}
+
+// GetSelectedPair returns the currently selected CandidatePair, or nil if none is selected.
+func (a *Agent) GetSelectedPair() *CandidatePair {
+	if p, ok := a.selectedPair.Load().(*CandidatePair); ok {
+		return p
+	}
+	return nil
+}
+
+// InvalidateSelectedPair clears the currently selected candidate pair and
+// resets the ICE agent back to Checking state. This allows the agent to
+// discover and connect via new candidate pairs after a server migration.
+func (a *Agent) InvalidateSelectedPair() error {
+	a.log.Infof("InvalidateSelectedPair called (agent=%p)", a)
+	return a.loop.Run(a.loop, func(_ context.Context) {
+		a.log.Infof("InvalidateSelectedPair executing in loop (agent=%p)", a)
+		a.setSelectedPair(nil)
+
+		// Reset the selector to allow re-nomination
+		a.setSelector()
+
+		// Clear the checklist and remote candidates entirely so we don't
+		// waste time pinging dead candidates from the old peer.
+		a.checklist = a.checklist[:0]
+		for k := range a.pairsByID {
+			delete(a.pairsByID, k)
+		}
+		for k := range a.remoteCandidates {
+			delete(a.remoteCandidates, k)
+		}
+
+		// Force back to checking state
+		a.updateConnectionState(ConnectionStateChecking)
+		a.requestConnectivityCheck()
+	})
 }
 
 func (a *Agent) addPair(local, remote Candidate) *CandidatePair {
@@ -1303,6 +1356,7 @@ func (a *Agent) GracefulClose() error {
 }
 
 func (a *Agent) close(graceful bool) error {
+	a.log.Infof("Agent.close called (agent=%p, graceful=%v)", a, graceful)
 	// the loop is safe to wait on no matter what
 	a.loop.Close()
 
@@ -1491,6 +1545,8 @@ func (a *Agent) handleInbound(msg *stun.Message, local Candidate, remote net.Add
 
 		return
 	}
+
+	a.log.Tracef("handleInbound STUN %s from %s to %s (pairs=%d, remotes=%d)", msg.Type.Class, remote, local, len(a.checklist), len(a.remoteCandidates))
 
 	remoteCandidate := a.findRemoteCandidate(local.NetworkType(), remote)
 

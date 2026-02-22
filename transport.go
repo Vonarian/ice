@@ -24,6 +24,24 @@ func (a *Agent) Accept(ctx context.Context, remoteUfrag, remotePwd string) (*Con
 	return a.connect(ctx, false, remoteUfrag, remotePwd)
 }
 
+// Resume is similar to Dial/Accept but returns a Conn immediately
+// without waiting for at least one candidate pair to connect.
+// Connectivity checks will continue in the background.
+func (a *Agent) Resume(isControlling bool, remoteUfrag, remotePwd string) (*Conn, error) {
+	err := a.loop.Err()
+	if err != nil {
+		return nil, err
+	}
+	err = a.startConnectivityChecks(isControlling, remoteUfrag, remotePwd) //nolint:contextcheck
+	if err != nil {
+		return nil, err
+	}
+
+	return &Conn{
+		agent: a,
+	}, nil
+}
+
 // Conn represents the ICE connection.
 // At the moment the lifetime of the Conn is equal to the Agent.
 type Conn struct {
