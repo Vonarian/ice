@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 //go:build !js
-// +build !js
 
 package ice
 
@@ -52,7 +51,7 @@ func (r *recordingSelector) HandleBindingRequest(*stun.Message, Candidate, Candi
 	r.handledBindingRequest = true
 }
 
-func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop
+func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 	defer test.CheckRoutines(t)()
 
 	// Limit runtime in case of deadlocks
@@ -66,7 +65,8 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop
 		}()
 
 		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
-			agent.selector = &controllingSelector{agent: agent, log: agent.log}
+			sel := &controllingSelector{agent: agent, log: agent.log}
+			agent.selector = sel
 
 			hostConfig := CandidateHostConfig{
 				Network:   "udp",
@@ -108,6 +108,355 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop
 		}))
 	})
 
+	t.Run("prflx candidate priority comes from inbound PRIORITY", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			sel := &controllingSelector{agent: agent, log: agent.log}
+			agent.selector = sel
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+
+			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remotePriority := uint32(123456)
+
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(remotePriority),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, remote)
+
+			set := agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+
+			c := set[0]
+			require.Equal(t, CandidateTypePeerReflexive, c.Type())
+			require.Equal(t, remotePriority, c.Priority())
+		}))
+	})
+
+	t.Run("Signaled host candidate replaces existing remote prflx candidate", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			sel := &controllingSelector{agent: agent, log: agent.log}
+			agent.selector = sel
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+			agent.localCandidates[local.NetworkType()] = []Candidate{local}
+
+			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(uint32(99999)),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, remote)
+
+			set := agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			prflx := set[0]
+			require.Equal(t, CandidateTypePeerReflexive, prflx.Type())
+			require.Len(t, agent.checklist, 1)
+			pair := agent.checklist[0]
+			require.Equal(t, prflx, pair.Remote)
+
+			local.addRemoteCandidateCache(prflx, remote)
+			prflx.seen(false)
+			prflx.seen(true)
+			oldLastReceived := prflx.LastReceived()
+			oldLastSent := prflx.LastSent()
+			oldPriority := pair.priority()
+			agent.setSelectedPair(pair)
+			sel.nominatedPair = pair
+
+			host, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "172.17.0.3",
+				Port:      999,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			agent.addRemoteCandidate(host) // nolint:contextcheck
+
+			set = agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			require.Equal(t, CandidateTypeHost, set[0].Type())
+			require.Equal(t, host, set[0])
+
+			updatedPair := agent.findPair(local, host)
+			require.NotNil(t, updatedPair)
+			require.NotSame(t, pair, updatedPair)
+			require.Equal(t, host, updatedPair.Remote)
+			require.Equal(t, oldPriority, updatedPair.priority())
+			require.False(t, updatedPair.Remote.LastReceived().IsZero())
+			require.WithinDuration(t, oldLastReceived, updatedPair.Remote.LastReceived(), 10*time.Millisecond)
+			require.False(t, updatedPair.Remote.LastSent().IsZero())
+			require.WithinDuration(t, oldLastSent, updatedPair.Remote.LastSent(), 10*time.Millisecond)
+			require.Equal(t, prflx, pair.Remote)
+			require.Same(t, updatedPair, agent.getSelectedPair())
+			require.Same(t, updatedPair, sel.nominatedPair)
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			require.True(t, ok)
+			require.Equal(t, host, cached)
+		}))
+	})
+
+	t.Run("Signaled srflx candidate replaces existing remote prflx candidate", func(t *testing.T) { // nolint:dupl
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			agent.selector = &controllingSelector{agent: agent, log: agent.log}
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+			agent.localCandidates[local.NetworkType()] = []Candidate{local}
+
+			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(uint32(99999)),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, remote)
+
+			set := agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			prflx := set[0]
+			require.Equal(t, CandidateTypePeerReflexive, prflx.Type())
+			require.Len(t, agent.checklist, 1)
+			pair := agent.checklist[0]
+			require.Equal(t, prflx, pair.Remote)
+
+			local.addRemoteCandidateCache(prflx, remote)
+			oldPriority := pair.priority()
+
+			srflx, err := NewCandidateServerReflexive(&CandidateServerReflexiveConfig{
+				Network:   "udp",
+				Address:   "172.17.0.3",
+				Port:      999,
+				Component: 1,
+				RelAddr:   "0.0.0.0",
+				RelPort:   0,
+			})
+			require.NoError(t, err)
+			agent.addRemoteCandidate(srflx) // nolint:contextcheck
+
+			set = agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			require.Equal(t, CandidateTypeServerReflexive, set[0].Type())
+			require.Equal(t, srflx, set[0])
+
+			updatedPair := agent.findPair(local, srflx)
+			require.NotNil(t, updatedPair)
+			require.NotSame(t, pair, updatedPair)
+			require.Equal(t, srflx, updatedPair.Remote)
+			require.Equal(t, oldPriority, updatedPair.priority())
+			require.Equal(t, prflx, pair.Remote)
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			require.True(t, ok)
+			require.Equal(t, srflx, cached)
+		}))
+	})
+
+	t.Run("Signaled relay candidate replaces existing remote prflx candidate", func(t *testing.T) { // nolint:dupl
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			agent.selector = &controllingSelector{agent: agent, log: agent.log}
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+			agent.localCandidates[local.NetworkType()] = []Candidate{local}
+
+			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(uint32(99999)),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, remote)
+
+			set := agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			prflx := set[0]
+			require.Equal(t, CandidateTypePeerReflexive, prflx.Type())
+			require.Len(t, agent.checklist, 1)
+			pair := agent.checklist[0]
+			require.Equal(t, prflx, pair.Remote)
+
+			local.addRemoteCandidateCache(prflx, remote)
+			oldPriority := pair.priority()
+
+			relay, err := NewCandidateRelay(&CandidateRelayConfig{
+				Network:   "udp",
+				Address:   "172.17.0.3",
+				Port:      999,
+				Component: 1,
+				RelAddr:   "0.0.0.0",
+				RelPort:   0,
+			})
+			require.NoError(t, err)
+			agent.addRemoteCandidate(relay) // nolint:contextcheck
+
+			set = agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			require.Equal(t, CandidateTypeRelay, set[0].Type())
+			require.Equal(t, relay, set[0])
+
+			updatedPair := agent.findPair(local, relay)
+			require.NotNil(t, updatedPair)
+			require.NotSame(t, pair, updatedPair)
+			require.Equal(t, relay, updatedPair.Remote)
+			require.Equal(t, oldPriority, updatedPair.priority())
+			require.Equal(t, prflx, pair.Remote)
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			require.True(t, ok)
+			require.Equal(t, relay, cached)
+		}))
+	})
+
+	t.Run("AcceptanceMinWait: prflx not accepted until replaced", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			agent.isControlling.Store(true)
+			agent.remoteUfrag = "remoteUfrag"
+			agent.remotePwd = "remotePwd"
+			agent.hostAcceptanceMinWait = 0
+			agent.prflxAcceptanceMinWait = time.Hour
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+			agent.localCandidates[local.NetworkType()] = []Candidate{local}
+
+			prflx, err := NewCandidatePeerReflexive(&CandidatePeerReflexiveConfig{
+				Network:   "udp",
+				Address:   "1.2.3.4",
+				Port:      999,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			agent.addRemoteCandidate(prflx) // nolint:contextcheck
+
+			pair := agent.findPair(local, prflx)
+			require.NotNil(t, pair)
+			require.Equal(t, CandidateTypeHost, pair.Local.Type())
+			require.Equal(t, CandidateTypePeerReflexive, pair.Remote.Type())
+			pair.state = CandidatePairStateSucceeded
+
+			sel := &controllingSelector{agent: agent, log: agent.log}
+			sel.Start()
+
+			// With prflxAcceptanceMinWait set high, remote prflx candidate should not be nominatable.
+			sel.ContactCandidates()
+			require.Nil(t, sel.nominatedPair)
+			require.False(t, pair.nominated)
+
+			// Trickle the signaled candidate for the same transport address.
+			signaled, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "1.2.3.4",
+				Port:      999,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			agent.addRemoteCandidate(signaled) // nolint:contextcheck
+
+			updatedPair := agent.findPair(local, signaled)
+			require.NotNil(t, updatedPair)
+			require.NotSame(t, pair, updatedPair)
+			require.Equal(t, CandidateTypePeerReflexive, pair.Remote.Type())
+			require.Equal(t, signaled, updatedPair.Remote)
+			require.Equal(t, CandidateTypeHost, updatedPair.Remote.Type())
+
+			// Now the (updated) pair should be nominatable and become nominated.
+			sel.ContactCandidates()
+			require.NotNil(t, sel.nominatedPair)
+			require.Same(t, updatedPair, sel.nominatedPair)
+			require.Equal(t, CandidateTypeHost, sel.nominatedPair.Local.Type())
+			require.Equal(t, CandidateTypeHost, sel.nominatedPair.Remote.Type())
+			require.True(t, updatedPair.nominated)
+		}))
+	})
+
 	t.Run("Bad network type with handleInbound()", func(t *testing.T) {
 		agent, err := NewAgent(&AgentConfig{})
 		require.NoError(t, err)
@@ -132,6 +481,47 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop
 			// nolint: contextcheck
 			agent.handleInbound(nil, local, remote)
 			require.Len(t, agent.remoteCandidates, 0)
+		}))
+	})
+
+	t.Run("prflx candidate is stored even when network type is disabled", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithNetworkTypes([]NetworkType{NetworkTypeTCP4}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			agent.selector = &recordingSelector{}
+
+			hostConfig := CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			}
+			local, err := NewCandidateHost(&hostConfig)
+			local.conn = &fakenet.MockPacketConn{}
+			require.NoError(t, err)
+
+			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(local.Priority()),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, remote)
+			require.Len(t, agent.remoteCandidates, 1)
+			require.Len(t, agent.remoteCandidates[NetworkTypeUDP4], 1)
 		}))
 	})
 
@@ -172,6 +562,49 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop
 			require.Len(t, agent.remoteCandidates, 0)
 		}))
 	})
+}
+
+func TestAddRemoteCandidateStoresCandidatesIndependentlyOfNetworkTypes(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	agent, err := NewAgentWithOptions(
+		WithNetworkTypes([]NetworkType{NetworkTypeUDP4}),
+	)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, agent.Close())
+	}()
+
+	tcpCandidate, err := UnmarshalCandidate("1052353102 1 tcp 1675624447 192.0.2.1 8080 typ host tcptype passive")
+	require.NoError(t, err)
+	require.NoError(t, agent.AddRemoteCandidate(tcpCandidate))
+
+	udpCandidate, err := UnmarshalCandidate("1052353102 1 udp 1675624447 192.0.2.2 8080 typ host")
+	require.NoError(t, err)
+	require.NoError(t, agent.AddRemoteCandidate(udpCandidate))
+
+	require.Eventually(t, func() bool {
+		actual, err := agent.GetRemoteCandidates()
+		if err != nil {
+			return false
+		}
+
+		if len(actual) != 2 {
+			return false
+		}
+
+		var hasUDP, hasTCP bool
+		for _, c := range actual {
+			if c.Address() == udpCandidate.Address() {
+				hasUDP = true
+			}
+			if c.Address() == tcpCandidate.Address() {
+				hasTCP = true
+			}
+		}
+
+		return hasUDP && hasTCP
+	}, time.Second, 10*time.Millisecond)
 }
 
 // Assert that Agent on startup sends message, and doesn't wait for connectivityTicker to fire
@@ -634,6 +1067,74 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		require.Equal(t, CandidatePairStateSucceeded, pair.state)
 		require.Empty(t, agent.pendingBindingRequests)
 	})
+
+	t.Run("Binding request from blocked prflx address is discarded", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithNet(newStubNet(t)),
+			WithMulticastDNSMode(MulticastDNSModeDisabled),
+			WithNetworkTypes([]NetworkType{NetworkTypeUDP4}),
+			WithRemoteIPFilter(func(ip net.IP) bool {
+				return !ip.Equal(net.IPv4(172, 17, 0, 44))
+			}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		local := newHostLocal(t)
+		selector := &recordingSelector{}
+		agent.selector = selector
+
+		msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+			stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+			stun.NewShortTermIntegrity(agent.localPwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+
+		remote := &net.UDPAddr{IP: net.IPv4(172, 17, 0, 44), Port: 9999}
+		agent.handleInbound(msg, local, remote)
+
+		require.False(t, selector.handledBindingRequest)
+		require.Len(t, agent.remoteCandidates, 0)
+	})
+
+	t.Run("Binding request prflx filter is called once", func(t *testing.T) {
+		filterCalls := 0
+		agent, err := NewAgentWithOptions(
+			WithNet(newStubNet(t)),
+			WithMulticastDNSMode(MulticastDNSModeDisabled),
+			WithNetworkTypes([]NetworkType{NetworkTypeUDP4}),
+			WithRemoteIPFilter(func(net.IP) bool {
+				filterCalls++
+
+				return filterCalls > 1
+			}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		local := newHostLocal(t)
+		selector := &recordingSelector{}
+		agent.selector = selector
+
+		msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+			stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+			stun.NewShortTermIntegrity(agent.localPwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+
+		remote := &net.UDPAddr{IP: net.IPv4(172, 17, 0, 45), Port: 9999}
+		agent.handleInbound(msg, local, remote)
+
+		require.Equal(t, 1, filterCalls)
+		require.False(t, selector.handledBindingRequest)
+		require.Len(t, agent.remoteCandidates, 0)
+	})
 }
 
 func TestInvalidAgentStarts(t *testing.T) {
@@ -925,7 +1426,7 @@ func TestSelectedCandidatePairStats(t *testing.T) { //nolint:cyclop
 		agent.addPair(hostLocal, srflxRemote)
 		candidatePair = agent.findPair(hostLocal, srflxRemote)
 	}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		candidatePair.UpdateRoundTripTime(time.Duration(i+1) * time.Second)
 	}
 
@@ -1466,7 +1967,7 @@ func TestGetRemoteCandidates(t *testing.T) {
 
 	expectedCandidates := []Candidate{}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cfg := CandidateHostConfig{
 			Network:   "udp",
 			Address:   "192.168.0.2",
@@ -1487,6 +1988,82 @@ func TestGetRemoteCandidates(t *testing.T) {
 	require.ElementsMatch(t, expectedCandidates, actualCandidates)
 }
 
+func TestRemoteIPFilterInAddRemoteCandidate(t *testing.T) {
+	agent, err := NewAgent(&AgentConfig{
+		RemoteIPFilter: func(ip net.IP) (keep bool) {
+			return !ip.Equal(net.IPv4(203, 0, 113, 9))
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, agent.Close())
+	}()
+
+	blocked, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   "udp",
+		Address:   "203.0.113.9",
+		Port:      40000,
+		Component: 1,
+	})
+	require.NoError(t, err)
+
+	allowed, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   "udp",
+		Address:   "198.51.100.10",
+		Port:      40001,
+		Component: 1,
+	})
+	require.NoError(t, err)
+
+	agent.addRemoteCandidate(blocked)
+	agent.addRemoteCandidate(allowed)
+
+	actual, err := agent.GetRemoteCandidates()
+	require.NoError(t, err)
+	require.Len(t, actual, 1)
+	require.Equal(t, allowed.Address(), actual[0].Address())
+}
+
+func TestAddRemoteCandidateHonorsRemoteIPFilter(t *testing.T) {
+	agent, err := NewAgent(&AgentConfig{
+		RemoteIPFilter: func(ip net.IP) (keep bool) {
+			return !ip.Equal(net.IPv4(203, 0, 113, 11))
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, agent.Close())
+	}()
+
+	blocked, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   "udp",
+		Address:   "203.0.113.11",
+		Port:      41000,
+		Component: 1,
+	})
+	require.NoError(t, err)
+
+	allowed, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   "udp",
+		Address:   "198.51.100.12",
+		Port:      41001,
+		Component: 1,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, agent.AddRemoteCandidate(blocked))
+	require.NoError(t, agent.AddRemoteCandidate(allowed))
+
+	require.Eventually(t, func() bool {
+		actual, err := agent.GetRemoteCandidates()
+		if err != nil {
+			return false
+		}
+
+		return len(actual) == 1 && actual[0].Address() == allowed.Address()
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestGetLocalCandidates(t *testing.T) {
 	var config AgentConfig
 
@@ -1499,7 +2076,7 @@ func TestGetLocalCandidates(t *testing.T) {
 	dummyConn := &net.UDPConn{}
 	expectedCandidates := []Candidate{}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cfg := CandidateHostConfig{
 			Network:   "udp",
 			Address:   "192.168.0.2",
@@ -2141,7 +2718,7 @@ func TestSetCandidatesUfrag(t *testing.T) {
 
 	dummyConn := &net.UDPConn{}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		cfg := CandidateHostConfig{
 			Network:   "udp",
 			Address:   "192.168.0.2",
@@ -2562,6 +3139,7 @@ func TestAgentUpdateOptions(t *testing.T) {
 			"WithRelayAcceptanceMinWait":          WithRelayAcceptanceMinWait(time.Second),
 			"WithSTUNGatherTimeout":               WithSTUNGatherTimeout(time.Second),
 			"WithIPFilter":                        WithIPFilter(func(net.IP) bool { return true }),
+			"WithRemoteIPFilter":                  WithRemoteIPFilter(func(net.IP) bool { return true }),
 			"WithNet":                             WithNet(nil),
 			"WithMulticastDNSMode":                WithMulticastDNSMode(MulticastDNSModeDisabled),
 			"WithMulticastDNSHostName":            WithMulticastDNSHostName("test.local"),
@@ -2582,6 +3160,7 @@ func TestAgentUpdateOptions(t *testing.T) {
 			"WithContinualGatheringPolicy":        WithContinualGatheringPolicy(GatherOnce),
 			"WithNetworkMonitorInterval":          WithNetworkMonitorInterval(time.Second),
 			"WithNetworkTypes":                    WithNetworkTypes([]NetworkType{NetworkTypeUDP4}),
+			"WithTURNTransportProtocols":          WithTURNTransportProtocols([]NetworkType{NetworkTypeTCP4}),
 			"WithCandidateTypes":                  WithCandidateTypes([]CandidateType{CandidateTypeHost}),
 			"WithAutomaticRenomination":           WithAutomaticRenomination(time.Second),
 			"WithInterfaceFilter":                 WithInterfaceFilter(func(string) bool { return true }),
@@ -2638,6 +3217,135 @@ func TestMDNSQueryTimeout(t *testing.T) {
 	t.Run("uses configured stun gather timeout when set", func(t *testing.T) {
 		agent := &Agent{stunGatherTimeout: 3 * time.Second}
 		require.Equal(t, 3*time.Second, agent.mDNSQueryTimeout())
+	})
+}
+
+func TestAddRemoteCandidateIndependentFromTURNTransportSelection(t *testing.T) {
+	t.Run("accepts UDP relay candidate with tcp-only configured network types and TURN/TCP URL", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:   []NetworkType{NetworkTypeTCP4},
+			CandidateTypes: []CandidateType{CandidateTypeRelay},
+			Urls: []*stun.URI{{
+				Scheme:   stun.SchemeTypeTURN,
+				Proto:    stun.ProtoTypeTCP,
+				Host:     "turn.example.com",
+				Port:     3478,
+				Username: "user",
+				Password: "pass",
+			}},
+		})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		cand, err := NewCandidateRelay(&CandidateRelayConfig{
+			Network:   udp,
+			Address:   "198.51.100.2",
+			Port:      5000,
+			Component: ComponentRTP,
+			RelAddr:   "192.0.2.10",
+			RelPort:   4000,
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			accepted := agent.addRemoteCandidate(cand) // nolint:contextcheck
+			require.True(t, accepted)
+			require.Len(t, agent.remoteCandidates[NetworkTypeUDP4], 1)
+		}))
+	})
+
+	// nolint:dupl
+	t.Run("accepts UDP host candidate with tcp-only configured network types and TURN/TCP URL", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:   []NetworkType{NetworkTypeTCP4},
+			CandidateTypes: []CandidateType{CandidateTypeRelay},
+			Urls: []*stun.URI{{
+				Scheme:   stun.SchemeTypeTURN,
+				Proto:    stun.ProtoTypeTCP,
+				Host:     "turn.example.com",
+				Port:     3478,
+				Username: "user",
+				Password: "pass",
+			}},
+		})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		cand, err := UnmarshalCandidate("1052353102 1 udp 1675624447 198.51.100.20 5002 typ host")
+		require.NoError(t, err)
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			accepted := agent.addRemoteCandidate(cand) // nolint:contextcheck
+			require.True(t, accepted)
+			require.Len(t, agent.remoteCandidates[NetworkTypeUDP4], 1)
+		}))
+	})
+
+	// nolint:dupl
+	t.Run("accepts UDP srflx candidate with tcp-only configured network types and TURN/TCP URL", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:   []NetworkType{NetworkTypeTCP4},
+			CandidateTypes: []CandidateType{CandidateTypeRelay},
+			Urls: []*stun.URI{{
+				Scheme:   stun.SchemeTypeTURN,
+				Proto:    stun.ProtoTypeTCP,
+				Host:     "turn.example.com",
+				Port:     3478,
+				Username: "user",
+				Password: "pass",
+			}},
+		})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		cand, err := UnmarshalCandidate(
+			"1052353102 1 udp 1675624447 198.51.100.21 5003 typ srflx raddr 192.0.2.21 rport 4003")
+		require.NoError(t, err)
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			accepted := agent.addRemoteCandidate(cand) // nolint:contextcheck
+			require.True(t, accepted)
+			require.Len(t, agent.remoteCandidates[NetworkTypeUDP4], 1)
+		}))
+	})
+
+	t.Run("stores UDP relay candidate regardless of TURN URL transport", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:   []NetworkType{NetworkTypeTCP4},
+			CandidateTypes: []CandidateType{CandidateTypeRelay},
+			Urls: []*stun.URI{{
+				Scheme: stun.SchemeTypeTURN,
+				Proto:  stun.ProtoTypeUDP,
+				Host:   "turn.example.com",
+				Port:   3478,
+			}},
+		})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		cand, err := NewCandidateRelay(&CandidateRelayConfig{
+			Network:   udp,
+			Address:   "198.51.100.3",
+			Port:      5001,
+			Component: ComponentRTP,
+			RelAddr:   "192.0.2.11",
+			RelPort:   4001,
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			accepted := agent.addRemoteCandidate(cand) // nolint:contextcheck
+			require.True(t, accepted)
+			require.Len(t, agent.remoteCandidates[NetworkTypeUDP4], 1)
+		}))
 	})
 }
 

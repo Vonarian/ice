@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 //go:build !js
-// +build !js
 
 package ice
 
@@ -14,6 +13,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,7 +125,7 @@ func TestBindingRequestHandler(t *testing.T) {
 		for _, c := range controlledAgent.localCandidates[NetworkTypeUDP4] {
 			cast, ok := c.(*CandidateHost)
 			require.True(t, ok)
-			cast.remoteCandidateCaches = map[AddrPort]Candidate{}
+			cast.remoteCandidateCaches = sync.Map{}
 		}
 
 		controlledAgent.setSelectedPair(nil)
@@ -266,15 +266,18 @@ func bareAgentForPing() *Agent {
 
 		connectionStateNotifier: &handlerNotifier{
 			done:                make(chan struct{}),
-			connectionStateFunc: func(ConnectionState) {}}, //nolint formatting
+			connectionStateFunc: func(ConnectionState) {},
+		}, //nolint formatting
 
 		candidateNotifier: &handlerNotifier{
 			done:          make(chan struct{}),
-			candidateFunc: func(Candidate) {}}, //nolint formatting
+			candidateFunc: func(Candidate) {},
+		}, //nolint formatting
 
 		selectedCandidatePairNotifier: &handlerNotifier{
 			done:              make(chan struct{}),
-			candidatePairFunc: func(*CandidatePair) {}}, //nolint formatting
+			candidatePairFunc: func(*CandidatePair) {},
+		}, //nolint formatting
 	}
 }
 
@@ -363,6 +366,103 @@ func TestControlledSelector_HandleSuccessResponse_UnknownTxID(t *testing.T) {
 	sel.HandleSuccessResponse(&m, local, remote, nil)
 
 	require.True(t, logger.warned, "expected Warnf to be called for unknown TransactionID (hitting !ok branch)")
+}
+
+// TestControlledSelector_NoTriggeredCheckAfterConnected verifies that once a pair
+// is in Succeeded state with a selected pair, HandleBindingRequest does NOT send
+// a triggered check (PingCandidate). Before the fix, every inbound Binding Request
+// unconditionally called PingCandidate, creating a ping-pong busy loop at 1/RTT.
+func TestControlledSelector_NoTriggeredCheckAfterConnected(t *testing.T) {
+	agent := bareAgentForPing()
+	agent.log = logging.NewDefaultLoggerFactory().NewLogger("test")
+	agent.remoteUfrag = selectionTestRemoteUfrag
+	agent.localUfrag = selectionTestLocalUfrag
+	agent.remotePwd = selectionTestPassword
+	agent.localPwd = selectionTestPassword
+	agent.tieBreaker = 1
+	agent.isControlling.Store(false)
+	agent.onConnected = make(chan struct{})
+	agent.setSelector()
+
+	selector, ok := agent.getSelector().(*controlledSelector)
+	require.True(t, ok, "expected controlledSelector")
+
+	local := newPingNoIOCand()
+	local.candidateBase.networkType = NetworkTypeUDP4
+	local.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+
+	remote := newPingNoIOCand()
+	remote.candidateBase.networkType = NetworkTypeUDP4
+	remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+
+	pair := agent.addPair(local, remote)
+	pair.state = CandidatePairStateSucceeded
+	agent.setSelectedPair(pair)
+
+	// Record requests sent before calling HandleBindingRequest.
+	sentBefore := pair.RequestsSent()
+
+	// Build a STUN Binding Request (no USE-CANDIDATE).
+	msg, err := stun.Build(stun.BindingRequest,
+		stun.TransactionID,
+		stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+		stun.NewShortTermIntegrity(agent.localPwd),
+		stun.Fingerprint,
+	)
+	require.NoError(t, err)
+
+	// Call HandleBindingRequest multiple times — simulates repeated inbound requests.
+	for range 10 {
+		selector.HandleBindingRequest(msg, local, remote)
+	}
+
+	// No triggered checks should have been sent since the pair is already connected.
+	assert.Equal(t, sentBefore, pair.RequestsSent(),
+		"triggered check should not be sent for a succeeded+selected pair")
+}
+
+// TestControlledSelector_TriggeredCheckDuringChecking verifies that a triggered
+// check IS sent when the pair is not yet in Succeeded state (normal ICE checking).
+func TestControlledSelector_TriggeredCheckDuringChecking(t *testing.T) {
+	agent := bareAgentForPing()
+	agent.log = logging.NewDefaultLoggerFactory().NewLogger("test")
+	agent.remoteUfrag = selectionTestRemoteUfrag
+	agent.localUfrag = selectionTestLocalUfrag
+	agent.remotePwd = selectionTestPassword
+	agent.localPwd = selectionTestPassword
+	agent.tieBreaker = 1
+	agent.isControlling.Store(false)
+	agent.onConnected = make(chan struct{})
+	agent.setSelector()
+
+	selector, ok := agent.getSelector().(*controlledSelector)
+	require.True(t, ok, "expected controlledSelector")
+
+	local := newPingNoIOCand()
+	local.candidateBase.networkType = NetworkTypeUDP4
+	local.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+
+	remote := newPingNoIOCand()
+	remote.candidateBase.networkType = NetworkTypeUDP4
+	remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+
+	pair := agent.addPair(local, remote)
+	// Pair is in Waiting state (not Succeeded), no selected pair — normal ICE checking.
+
+	sentBefore := pair.RequestsSent()
+
+	msg, err := stun.Build(stun.BindingRequest,
+		stun.TransactionID,
+		stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+		stun.NewShortTermIntegrity(agent.localPwd),
+		stun.Fingerprint,
+	)
+	require.NoError(t, err)
+
+	selector.HandleBindingRequest(msg, local, remote)
+
+	assert.Greater(t, pair.RequestsSent(), sentBefore,
+		"triggered check should be sent during ICE checking phase")
 }
 
 func TestAutomaticRenomination(t *testing.T) { //nolint:maintidx

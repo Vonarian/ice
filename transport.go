@@ -12,16 +12,67 @@ import (
 	"github.com/pion/stun/v3"
 )
 
-// Dial connects to the remote agent, acting as the controlling ice agent.
-// Dial blocks until at least one ice candidate pair has successfully connected.
-func (a *Agent) Dial(ctx context.Context, remoteUfrag, remotePwd string) (*Conn, error) {
-	return a.connect(ctx, true, remoteUfrag, remotePwd)
+// AwaitConnect waits until a pair is selected.
+func (a *Agent) AwaitConnect(ctx context.Context) error {
+	select {
+	case <-a.loop.Done():
+		return a.loop.Err()
+	case <-ctx.Done():
+		return ErrCanceledByCaller
+	case <-a.onConnected:
+	}
+
+	return nil
 }
 
-// Accept connects to the remote agent, acting as the controlled ice agent.
+// StartDial sets the agent up for connecting to the remote agent, acting as the
+// controlling agent and returns immediately.
+func (a *Agent) StartDial(remoteUfrag, remotePwd string) (*Conn, error) {
+	conn, err := a.startConnect(true, remoteUfrag, remotePwd)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+// Dial blocks until at least one ice candidate pair has successfully connected.
+func (a *Agent) Dial(ctx context.Context, remoteUfrag, remotePwd string) (*Conn, error) {
+	conn, err := a.StartDial(remoteUfrag, remotePwd) //nolint:contextcheck
+	if err != nil {
+		return nil, err
+	}
+	err = a.AwaitConnect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+// StartAccept sets the agent up for connecting to the remote agent, acting as the
+// controlled agent and returns immediately.
+func (a *Agent) StartAccept(remoteUfrag, remotePwd string) (*Conn, error) {
+	conn, err := a.startConnect(false, remoteUfrag, remotePwd)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 // Accept blocks until at least one ice candidate pair has successfully connected.
 func (a *Agent) Accept(ctx context.Context, remoteUfrag, remotePwd string) (*Conn, error) {
-	return a.connect(ctx, false, remoteUfrag, remotePwd)
+	conn, err := a.StartAccept(remoteUfrag, remotePwd) //nolint:contextcheck
+	if err != nil {
+		return nil, err
+	}
+	err = a.AwaitConnect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
 }
 
 // Resume is similar to Dial/Accept but returns a Conn immediately
@@ -60,7 +111,7 @@ func (c *Conn) BytesReceived() uint64 {
 	return c.bytesReceived.Load()
 }
 
-func (a *Agent) connect(ctx context.Context, isControlling bool, remoteUfrag, remotePwd string) (*Conn, error) {
+func (a *Agent) startConnect(isControlling bool, remoteUfrag, remotePwd string) (*Conn, error) {
 	err := a.loop.Err()
 	if err != nil {
 		return nil, err
@@ -68,15 +119,6 @@ func (a *Agent) connect(ctx context.Context, isControlling bool, remoteUfrag, re
 	err = a.startConnectivityChecks(isControlling, remoteUfrag, remotePwd) //nolint:contextcheck
 	if err != nil {
 		return nil, err
-	}
-
-	// Block until pair selected
-	select {
-	case <-a.loop.Done():
-		return nil, a.loop.Err()
-	case <-ctx.Done():
-		return nil, ErrCanceledByCaller
-	case <-a.onConnected:
 	}
 
 	return &Conn{

@@ -208,6 +208,20 @@ func TestWithIPFilterOption(t *testing.T) {
 	assert.False(t, agent.ipFilter(net.IPv4(192, 0, 2, 1)))
 }
 
+func TestWithRemoteIPFilterOption(t *testing.T) {
+	filter := func(ip net.IP) bool {
+		return ip.IsPrivate()
+	}
+
+	agent, err := NewAgentWithOptions(WithRemoteIPFilter(filter))
+	require.NoError(t, err)
+	defer agent.Close() //nolint:errcheck
+
+	require.NotNil(t, agent.remoteIPFilter)
+	assert.True(t, agent.remoteIPFilter(net.IPv4(192, 168, 1, 10)))
+	assert.False(t, agent.remoteIPFilter(net.IPv4(203, 0, 113, 1)))
+}
+
 func TestWithNetOption(t *testing.T) {
 	stub := newStubNet(t)
 
@@ -358,8 +372,8 @@ func TestWithNominationAttribute(t *testing.T) {
 		assert.NoError(t, err)
 		defer agent.Close() //nolint:errcheck
 
-		// Should use default value 0x0030
-		assert.Equal(t, stun.AttrType(0x0030), agent.nominationAttribute)
+		// Should use default value 0xC001
+		assert.Equal(t, stun.AttrType(0xC001), agent.nominationAttribute)
 	})
 }
 
@@ -513,7 +527,7 @@ func TestMultipleConfigOptions(t *testing.T) {
 func TestWithInterfaceFilter(t *testing.T) {
 	t.Run("sets interface filter", func(t *testing.T) {
 		filter := func(interfaceName string) bool {
-			return interfaceName == "eth0"
+			return interfaceName == "eth0" // nolint:goconst
 		}
 
 		agent, err := NewAgentWithOptions(WithInterfaceFilter(filter))
@@ -521,7 +535,7 @@ func TestWithInterfaceFilter(t *testing.T) {
 		defer agent.Close() //nolint:errcheck
 
 		assert.NotNil(t, agent.interfaceFilter)
-		assert.True(t, agent.interfaceFilter("eth0"))
+		assert.True(t, agent.interfaceFilter("eth0")) // nolint:goconst
 		assert.False(t, agent.interfaceFilter("wlan0"))
 	})
 
@@ -549,7 +563,7 @@ func TestWithInterfaceFilter(t *testing.T) {
 
 		assert.NotNil(t, agent.interfaceFilter)
 		assert.True(t, agent.interfaceFilter("lo"))
-		assert.False(t, agent.interfaceFilter("eth0"))
+		assert.False(t, agent.interfaceFilter("eth0")) // nolint:goconst
 	})
 }
 
@@ -599,6 +613,86 @@ func TestWithNetworkTypesAppliedBeforeRestart(t *testing.T) {
 		defer func() { require.NoError(t, agent.Close()) }()
 
 		assert.Zero(t, stub.udp6ListenCount, "unexpected ipv6 listen before restart")
+	})
+}
+
+func TestWithNetworkTypes(t *testing.T) {
+	t.Run("applies option", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithNetworkTypes([]NetworkType{NetworkTypeUDP4, NetworkTypeTCP4}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.Equal(t, []NetworkType{NetworkTypeUDP4, NetworkTypeTCP4}, agent.networkTypes)
+	})
+
+	t.Run("deduplicates values", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithNetworkTypes([]NetworkType{NetworkTypeUDP4, NetworkTypeUDP4, NetworkTypeTCP4}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.Equal(t, []NetworkType{NetworkTypeUDP4, NetworkTypeTCP4}, agent.networkTypes)
+	})
+
+	t.Run("rejects unsupported value", func(t *testing.T) {
+		_, err := NewAgentWithOptions(
+			WithNetworkTypes([]NetworkType{NetworkType(0)}),
+		)
+		require.ErrorIs(t, err, ErrProtoType)
+	})
+
+	t.Run("rejects unsupported value from config", func(t *testing.T) {
+		_, err := NewAgent(&AgentConfig{
+			NetworkTypes: []NetworkType{NetworkType(0)},
+		})
+		require.ErrorIs(t, err, ErrProtoType)
+	})
+}
+
+func TestWithTURNTransportProtocols(t *testing.T) {
+	t.Run("applies option", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithTURNTransportProtocols([]NetworkType{NetworkTypeTCP4}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.Equal(t, []NetworkType{NetworkTypeTCP4}, agent.turnTransportProtocols)
+	})
+
+	t.Run("deduplicates protocols", func(t *testing.T) {
+		agent, err := NewAgentWithOptions(
+			WithTURNTransportProtocols([]NetworkType{NetworkTypeTCP4, NetworkTypeTCP4, NetworkTypeUDP4}),
+		)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.Equal(t, []NetworkType{NetworkTypeTCP4, NetworkTypeUDP4}, agent.turnTransportProtocols)
+	})
+
+	t.Run("rejects unsupported proto", func(t *testing.T) {
+		_, err := NewAgentWithOptions(
+			WithTURNTransportProtocols([]NetworkType{NetworkType(0)}),
+		)
+		require.ErrorIs(t, err, ErrProtoType)
+	})
+
+	t.Run("rejects unsupported proto from config", func(t *testing.T) {
+		_, err := NewAgent(&AgentConfig{
+			turnTransportProtocols: []NetworkType{NetworkType(0)},
+		})
+		require.ErrorIs(t, err, ErrProtoType)
 	})
 }
 
@@ -698,7 +792,6 @@ func TestWith1To1CandidateIPOptions(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			assertAddressRewriteOption(
 				t,
@@ -1484,7 +1577,6 @@ func TestAgentConfigNAT1To1IPs(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			stub := newStubNet(t)
 			config := tc.config
